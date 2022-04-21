@@ -268,5 +268,5 @@ val merlin : bool
 (**/**)
 
 
-val disable_local
+val local_allocations : bool
 (** Whether we use local allocations *)

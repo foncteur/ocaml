@@ -251,4 +251,4 @@ let config_var x =
 
 let merlin = false
 
-let disable_local = true
+let local_allocations = false
