@@ -250,3 +250,5 @@ let config_var x =
       Some s
 
 let merlin = false
+
+let disable_local = true

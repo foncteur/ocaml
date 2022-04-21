@@ -266,3 +266,7 @@ val config_var : string -> string option
 val merlin : bool
 
 (**/**)
+
+
+val disable_local
+(** Whether we use local allocations *)

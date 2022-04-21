@@ -178,6 +178,18 @@ let emit_call_gc gc =
   `{emit_label gc.gc_lbl}:	bl	{emit_symbol "caml_call_gc"}\n`;
   `{emit_label gc.gc_frame_lbl}:	b	{emit_label gc.gc_return_lbl}\n`
 
+(* Record calls to local stack reallocation *)
+
+type local_realloc_call =
+  { lr_lbl: label;
+    lr_return_lbl: label; }
+
+let local_realloc_sites = ref ([] : local_realloc_call list)
+
+let emit_local_realloc lr =
+  `{emit_label lr.lr_lbl}:  bl  {emit_symbol "caml_call_local_realloc"}\n`;
+  ` b {emit_label lr.lr_return_lbl}\n`
+
 (* Record calls to caml_ml_array_bound_error.
    In debug mode, we maintain one call to caml_ml_array_bound_error
    per bound check site. Otherwise, we can share a single call. *)
@@ -398,6 +410,7 @@ let num_call_gc_and_check_bound_points instr =
   let rec loop instr ((call_gc, check_bound) as totals) =
     match instr.desc with
     | Lend -> totals
+    (*| Lop (Ialloc { mode = Alloc_local }) -> loop instr.next totals *)
     | Lop (Ialloc _) when !fastcode_flag ->
       loop instr.next (call_gc + 1, check_bound)
     | Lop (Iintop Icheckbound)
@@ -503,6 +516,7 @@ module BR = Branch_relaxation.Make (struct
     | Lop (Iload (size, addr)) | Lop (Istore (size, addr, _)) ->
       let based = match addr with Iindexed _ -> 0 | Ibased _ -> 1 in
       based + begin match size with Single -> 2 | _ -> 1 end
+    (*| Lop (Ialloc { mode = Alloc_local }) -> 9 *)
     | Lop (Ialloc _) when !fastcode_flag -> 5
     | Lop (Ispecific (Ifar_alloc _)) when !fastcode_flag -> 6
     | Lop (Ialloc { bytes = num_bytes; _ })
@@ -511,8 +525,7 @@ module BR = Branch_relaxation.Make (struct
       | 16 | 24 | 32 -> 1
       | _ -> 1 + num_instructions_for_intconst (Nativeint.of_int num_bytes)
       end
-    | Lop (Ibeginregion | Iendregion) ->
-       Misc.fatal_error "Local allocations not supported on this architecture"
+    | Lop (Ibeginregion | Iendregion) -> 1
     | Lop (Iintop (Icomp _)) -> 2
     | Lop (Iintop_imm (Icomp _, _)) -> 2
     | Lop (Iintop (Icheckbound)) -> 2
@@ -773,12 +786,36 @@ let emit_instr i =
         | Word_int | Word_val | Double ->
             `	str	{emit_reg src}, {emit_addressing addr base}\n`
         end
-    | Lop(Ialloc { bytes = n; dbginfo; mode = Alloc_heap }) ->
+    | Lop(Ialloc { bytes = n; dbginfo; mode = (Alloc_heap | Alloc_local)}) ->
         assembly_code_for_allocation i ~n ~far:false ~dbginfo
     | Lop(Ispecific (Ifar_alloc { bytes = n; dbginfo })) ->
         assembly_code_for_allocation i ~n ~far:true ~dbginfo
-    | Lop(Ialloc { mode = Alloc_local } | Ibeginregion | Iendregion) ->
-       Misc.fatal_error "Local allocations not supported on this architecture"
+   (*  | Lop(Ialloc { bytes = n; dbginfo=_; mode = Alloc_local }) ->
+        let lbl_call = new_label() in
+        let lbl_after_alloc = new_label() in
+        let offset_sp = Domainstate.(idx_of_field Domain_local_sp) * 8 in
+        let offset_limit = Domainstate.(idx_of_field Domain_local_limit) * 8 in
+        let offset_top = Domainstate.(idx_of_field Domain_local_top) * 8 in
+        `	ldr	{emit_reg reg_tmp1}, [{emit_reg reg_domain_state_ptr}, #{emit_int offset_sp}]\n`;
+        `	sub	{emit_reg reg_tmp1}, {emit_reg reg_tmp1}, #{emit_int n}\n`;
+        `	str	{emit_reg reg_tmp1}, [{emit_reg reg_domain_state_ptr}, {emit_int offset_sp}]\n`;
+        `	ldr	{emit_reg reg_x8}, [{emit_reg reg_domain_state_ptr}, #{emit_int offset_limit}]\n`;
+        `	cmp	{emit_reg reg_tmp1}, {emit_reg reg_x8}\n`;
+        `	b.lt	{emit_label lbl_call}\n`;
+        `{emit_label lbl_after_alloc}:`;
+        `	ldr	{emit_reg reg_x8}, [{emit_reg reg_domain_state_ptr}, #{emit_int offset_top}]\n`;
+        ` add {emit_reg reg_tmp1}, {emit_reg reg_tmp1}, {emit_reg reg_x8}\n`;
+        ` add	{emit_reg i.res.(0)}, {emit_reg reg_tmp1}, #8\n`;
+        local_realloc_sites :=
+          { lr_lbl = lbl_call;
+            lr_return_lbl = lbl_after_alloc } :: !local_realloc_sites *)
+    | Lop(Ibeginregion) ->
+        emit_intconst i.res.(0) 0n
+       (* let offset = Domainstate.(idx_of_field Domain_local_sp) * 8 in
+        ` ldr {emit_reg i.res.(0)}, [{emit_reg reg_domain_state_ptr}, #{emit_int offset}]\n` *)
+    | Lop(Iendregion) -> ()
+      (*  let offset = Domainstate.(idx_of_field Domain_local_sp) * 8 in
+        `	str	{emit_reg i.arg.(0)}, [{emit_reg reg_domain_state_ptr}, {emit_int offset}]\n` *)
     | Lop(Iintop_imm(Iadd, n)) ->
         emit_addimm i.res.(0) i.arg.(0) n
     | Lop(Iintop_imm(Isub, n)) ->
@@ -1017,6 +1054,7 @@ let fundecl fundecl =
   float_literals := [];
   stack_offset := 0;
   call_gc_sites := [];
+  local_realloc_sites := [];
   bound_error_sites := [];
     for i = 0 to Proc.num_register_classes - 1 do
     num_stack_slots.(i) <- fundecl.fun_num_stack_slots.(i);
@@ -1040,6 +1078,7 @@ let fundecl fundecl =
   BR.relax fundecl.fun_body ~max_out_of_line_code_offset;
   emit_all fundecl.fun_body;
   List.iter emit_call_gc !call_gc_sites;
+  List.iter emit_local_realloc !local_realloc_sites;
   List.iter emit_call_bound_error !bound_error_sites;
   assert (List.length !call_gc_sites = num_call_gc);
   assert (List.length !bound_error_sites = num_check_bound);
